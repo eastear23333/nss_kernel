@@ -1,0 +1,10 @@
+#version 450
+#extension GL_EXT_shader_integer_dot_product : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly  buffer A { uint  a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { uint  b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { int   c[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    c[i] = dot4AddI8Packed(a[i], b[i], int(i));
+}

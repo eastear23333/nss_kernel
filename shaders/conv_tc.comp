@@ -1,0 +1,532 @@
+/*
+ * conv_tc.comp —— 用 int8 cooperative matrix（Tensor Core / MMA）实现的
+ * 同一套 CONV2D + bias + RESCALE(+LUT)，与 conv_rq.comp（DP4A）**逐位等价**。
+ *
+ * 原理：DP4A 版每条 spv_sdot 只做 4 个 int8 MAC；MMA 一条指令做
+ * 16×16×32 = 8192 个 MAC（指令数降 ~2048 倍）。而 int32 累加是精确整数运算、
+ * 与求和顺序无关，所以换成 MMA 不改变数值 —— 位精确天然成立。
+ *
+ * ★ 矩阵切分（M=16 N=16 K=32，取自驱动上报的 sint8 形状）
+ *   A（16×32）：16 个「同一行的连续输出像素」 × 32 个输入通道
+ *   B（32×16）：32 个输入通道 × 16 个输出通道
+ *   C（16×16）：累加器
+ *   K 轴按 (ky, kx, cdx) 分块，每块 32 个「通道」；块内 k = 通道偏移。
+ *     chunk = (ky*kw + kx) * cdxCount + cdx,   cdx ∈ [0, ceil(Cin/32))
+ *   Cin 不是 32 倍数时，多出来的通道用 z_a(−128, 0x80) 填充 / 权重补 0，
+ *   与 DP4A 版「越界/补零 tap 用 z_a」的约定一致，乘积贡献 0。
+ *
+ * ★ WARPS 的取值：实测 1 与 4 基本同速（4 略差），故取 1（结构最简单）。
+ *   曾假设「local_size=32 时 NVIDIA 每 SM 最多 32 个 workgroup ⇒ 占用率只有 67%」
+ *   是瓶颈，改成 4 warp/workgroup 后并无收益 ⇒ 内核不是占用率受限。
+ *   ★ 但代码保留了多 warp 能力：workgroup 内**不能有提前 return**（barrier 必须
+ *     全员到达），行越界用「钳位 oy + 只对有效行写输出」处理。
+ *
+ * ★ A 的两条加载路径
+ *   staged = true  —— 主机输入（无边框）：越界 tap 必须显式判定，
+ *                     先 im2col 到 shared 再 coopMatLoad。
+ *   staged = false —— 内部带边框缓冲：越界 tap 由 0x80 边框天然供给
+ *                     （边框填充值就是 z_a），通道补齐位读到的越界 word
+ *                     乘以权重里的 0 ⇒ 贡献 0。于是可以直接从全局激活
+ *                     coopMatLoad，省掉 128 次 shared 写 + 2 次 barrier。
+ *
+ * ★ stride 单位（实测确认，别想当然）
+ *   coopMatLoad/Store 的 element / stride 以 **缓冲区元素类型** 为单位，
+ *   不是矩阵分量类型。int8 矩阵放在 shared uint[]（行 = 8 word = 32 字节）里
+ *   时，行跨距要传 8 而不是 32。
+ */
+
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+/* ── 诊断探针（仅性能定位用，不保证数值正确；默认 0 = 生产内核）──
+ *   1 = A 的加载地址钉在 0（跨距 0）⇒ 全部命中同一 cache line，测「A 访存」
+ *   2 = 强制 nBlocks=1 ⇒ MMA / B 加载 / 导出全部减半，测「MMA+导出」随工作量的伸缩
+ *   3 = 跳过 quant1（直接存累加器低字节）⇒ 测重量化本身的成本
+ *   4 = ★ 串行 nBlock 循环（同一时刻只有 1 个累加器存活，总工作量不变，
+ *         代价是每个 nBlock 重载一遍 A）⇒ 测「累加器寄存器压力」是否是主因
+ *   6 = B 的加载地址钉在 0 ⇒ 测 B 访存
+ *   8 = 只做 coopMatStore，跳过打包循环（量化的全局装载 + 打包 + 写回全砍）
+ *   9 = MMA 数量 +50%（其它不变）⇒ 判断是否 MMA 受限
+ *  10/11 = 二分 MMA 相与导出相（需配合 nBlocksExp）
+ *  12 = 导出批量化：所有累加器一次倒进 shared，只做一对 barrier（4KB shared）
+ *  13 = 通道块切到 gridZ（每 workgroup 1 块）—— 需 DLL 侧 NSS_DP4A_TC_NBSPLIT=1
+ *  14 = ★ WARPS=2 + 每 warp 独立 shared 切片 + subgroup 级同步
+ *       （需 DLL 侧 NSS_DP4A_TC_WARPS=2；P13 证明 workgroup 数量是负资产，
+ *         P12 证明 barrier 次数不是关键 ⇒ 试「减少 workgroup 数 + 缩小 barrier 范围」）
+ * 用 glslangValidator -DPROBE=n 编译，不需要改源码。 */
+#ifndef PROBE
+#define PROBE 0
+#endif
+
+/* 每个 workgroup 的 warp 数。必须与 DLL 侧 convTcWarps() 一致（那边用它缩放 gridY）。 */
+#if PROBE == 14
+#define WARPS 2u
+#else
+#define WARPS 1u
+#endif
+
+#if PROBE == 14
+/* 每 warp 独立 shared 切片 ⇒ 同步只需 subgroup 级（NVIDIA 上 subgroup == warp），
+ * 同 workgroup 的其它 warp 不必陪跑 workgroup barrier。 */
+#extension GL_KHR_shader_subgroup_basic : require
+#define WG_SYNC() do { subgroupMemoryBarrierShared(); subgroupBarrier(); } while (false)
+#else
+#define WG_SYNC() barrier()
+#endif
+
+layout(local_size_x = 32 * WARPS) in;
+
+layout(push_constant) uniform PC {
+    uint in_w;          // 输入紧致宽（不含边框）
+    uint in_c4;         // Cin / 4
+    uint out_h;
+    uint out_w;
+    uint out_c4;        // Cout / 4
+    int  pad_top;
+    int  pad_left;
+    uint stride_h;
+    uint stride_w;
+    int  out_zp;
+    uint kh;
+    uint kw;
+    uint has_lut;
+    uint dbg;           // TC 内核未用（保留与 conv_rq 的布局对齐）
+    uint inH;           // 输入紧致高（inBorded=0 时用于越界判定）
+    uint inBorded;      // 1=输入带 1px 边框的内部缓冲；0=宿主紧致缓冲
+    uint outBorded;     // 1=写带边框的内部缓冲；0=直接写宿主紧致缓冲
+    /* --- TC 专用 --- */
+    uint cdxCount;      // ceil(Cin / 32)
+    uint nPad;          // round_up(Cout, 16)
+    uint nBlocks;       // nPad / 16
+} pc;
+
+layout(set = 0, binding = 0) readonly  buffer ActIn  { uint   d[]; } actIn;
+layout(set = 0, binding = 1) readonly  buffer WTc    { int8_t d[]; } wTc;
+layout(set = 0, binding = 2) readonly  buffer BiasCr { int    d[]; } biasCr;
+layout(set = 0, binding = 3) readonly  buffer Mult   { int    d[]; } mult;
+layout(set = 0, binding = 4) readonly  buffer Shift  { int    d[]; } shiftB;
+layout(set = 0, binding = 5) readonly  buffer Lut    { int    d[]; } lut;
+layout(set = 0, binding = 6) writeonly buffer ActOut { uint   d[]; } actOut;
+
+/*
+ * ★ 共享内存只有 1 KiB（256 个 int = 1024 B），两个用途**复用同一块**：
+ *   - staged 路径的 A 暂存（16×32 int8 = 128 word）
+ *   - MMA 累加器导出（16×16 int32 = 256 int，一次一个 nBlock）
+ *   两者在时间上不重叠（A 只在 chunk 循环里用，导出在循环之后）。
+ *
+ * 实测依据（probe3）：把共享内存强行加到 20 KiB 后帧时间 3.28 → 5.36 ms（+63%）
+ * ⇒ 本内核是**占用率/延迟敏感**的，共享内存越小越好。
+ * 之前版本用 4.5 KiB（sC 4 KiB + sA 0.5 KiB）⇒ 每 SM 只有约 10 个 workgroup
+ * = 10 warps/SM（21%）。压到 1 KiB 后可到 32 warps/SM（67%）。
+ */
+#if PROBE == 12
+shared int sShared[1024];   /* P12：4 个块各占 256 int（4 KiB） */
+#elif PROBE == 14
+shared int sShared[512];    /* P14：每 warp 一片 256 int，共 2 个 warp（2 KiB） */
+#else
+shared int sShared[256];
+#endif
+
+/* 与 conv_rq.comp 的 packOut 逐字等价：bias → 重量化 → +zp → clamp → LUT。 */
+int quant1(int acc, int oc) {
+    int v  = acc + biasCr.d[oc];
+    int sh = shiftB.d[oc];
+    int64_t r = (int64_t(v) * int64_t(mult.d[oc]) + (int64_t(1) << (sh - 1))) >> sh;
+    r += int64_t(pc.out_zp);
+    r  = clamp(r, int64_t(-128), int64_t(127));
+    int q = int(r);
+    if (pc.has_lut != 0u) {
+        q = lut.d[q + 128];
+    }
+    return q;
+}
+
+void main() {
+    const uint warp  = gl_LocalInvocationID.x >> 5u;
+    const uint lane  = gl_LocalInvocationID.x & 31u;
+    /* PROBE=14：每个 warp 用自己那一片 shared，互不干扰 ⇒ 同步可降到 subgroup 级 */
+    const uint warpBase = warp * 256u;
+    const uint ox0   = gl_WorkGroupID.x * 16u;
+    const uint oyRaw = gl_WorkGroupID.y * WARPS + warp;
+
+    const bool hostIn = (pc.inBorded == 0u);
+    const bool staged = hostIn;
+
+    /*
+     * ★ 不能在这里提前 return：下面 staged 路径有 barrier，必须全员到达。
+     * 行越界时把 oy 钳到末行（地址仍合法），只跳过最终的输出写入。
+     */
+    const bool rowOk = (oyRaw < pc.out_h);
+    const uint oy = rowOk ? oyRaw : (pc.out_h - 1u);
+
+    coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> mA;
+    coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> mB;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc3;
+    acc0 = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    acc1 = acc0;
+    acc2 = acc0;
+    acc3 = acc0;
+
+    const uint inRowWords  = pc.in_w * pc.in_c4;                 /* 紧致行宽（word） */
+    const uint inRowWordsB = (pc.in_w + 2u) * pc.in_c4;          /* 带边框行宽（word） */
+
+    /* PROBE=2：把输出块数砍到 1，MMA / B 加载 / 导出同时减半 */
+    const uint nBlocksUse = (PROBE == 2) ? 1u : pc.nBlocks;
+    /* PROBE=10/11：二分「MMA 相」与「导出相」——
+     *   10 = MMA 相全量、导出只跑 1 块
+     *   11 = MMA 相只跑 1 块、导出跑满 pc.nBlocks（数值无意义，只测时间） */
+    const uint nBlocksExp = (PROBE == 10) ? 1u
+                          : ((PROBE == 11) ? pc.nBlocks : nBlocksUse);
+
+#if PROBE == 13
+    /* ═══ P13：通道块切到 gridZ ═══
+     * 每个 workgroup 只负责 1 个 16 通道块（nb = gl_GlobalInvocationID.z）⇒
+     *   · 只有 1 个累加器存活
+     *   · 导出只做 1 轮（1 次 coopMatStore + 1 对 barrier）
+     * 依据：P10（导出从 2 块砍到 1 块）−46%，而 P11/P9 证明 MMA 数量完全不影响耗时
+     * ⇒ 成本在「每个 workgroup 内第 2 轮导出」的强非线性上，把它分给更多 workgroup
+     *    让其互相重叠，应当有收益。**需要 DLL 侧把 dz 设为 nBlocks（NSS_DP4A_TC_NBSPLIT=1）**。 */
+    {
+        const uint nb = gl_GlobalInvocationID.z;
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accS
+                = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+        for (uint ky = 0u; ky < pc.kh; ++ky) {
+            const int iyC = int(oy) * int(pc.stride_h) - pc.pad_top + int(ky);
+            const int iyB = iyC + 1;
+            const bool yBad = hostIn && (iyC < 0 || iyC >= int(pc.inH));
+            for (uint kx = 0u; kx < pc.kw; ++kx) {
+                const uint aElem = uint(iyB) * inRowWordsB
+                                 + uint(int(ox0) * int(pc.stride_w) - pc.pad_left + int(kx) + 1) * pc.in_c4;
+                const uint aStride = pc.stride_w * pc.in_c4;
+                for (uint cdx = 0u; cdx < pc.cdxCount; ++cdx) {
+                    if (staged) {
+                        for (uint e = 0u; e < 4u; ++e) {
+                            const uint idx = lane + e * 32u;
+                            const uint m   = idx >> 3;
+                            const uint w4  = idx & 7u;
+                            const uint ic4 = cdx * 8u + w4;
+                            uint val = 0x80808080u;
+                            if (ic4 < pc.in_c4 && !yBad) {
+                                const int ixC = (int(ox0) + int(m)) * int(pc.stride_w)
+                                                - pc.pad_left + int(kx);
+                                if (!(ixC < 0 || ixC >= int(pc.in_w))) {
+                                    val = actIn.d[uint(iyC) * inRowWords
+                                                  + uint(ixC) * pc.in_c4 + ic4];
+                                }
+                            }
+                            sShared[warpBase + idx] = int(val);
+                        }
+                        WG_SYNC();
+                        coopMatLoad(mA, sShared, warpBase, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                    } else {
+                        coopMatLoad(mA, actIn.d, aElem + cdx * 8u, aStride,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    const uint chunk = (ky * pc.kw + kx) * pc.cdxCount + cdx;
+                    coopMatLoad(mB, wTc.d, chunk * 32u * pc.nPad + nb * 16u, pc.nPad,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    accS = coopMatMulAdd(mA, mB, accS);
+                    if (staged) {
+                        WG_SYNC();
+                    }
+                }
+            }
+        }
+
+        if (rowOk) {
+            const uint outRowWords = (pc.outBorded != 0u) ? (pc.out_w + 2u) * pc.out_c4
+                                                          : pc.out_w * pc.out_c4;
+            const uint outRowBase  = ((pc.outBorded != 0u) ? (oy + 1u) * outRowWords + pc.out_c4
+                                                           : oy * outRowWords)
+                                     + ox0 * pc.out_c4;
+            const uint cout = pc.out_c4 * 4u;
+            coopMatStore(accS, sShared, warpBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            WG_SYNC();
+            for (uint i = lane; i < 64u; i += 32u) {
+                const uint m   = i & 15u;
+                const uint jg  = i >> 4;
+                const uint oc0 = nb * 16u + jg * 4u;
+                const uint ox  = ox0 + m;
+                if (oc0 >= cout || ox >= pc.out_w) {
+                    continue;
+                }
+                const uint cbase = m * 16u + jg * 4u;
+                uint packed = 0u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 0u], int(oc0 + 0u)) & 0xFF) <<  0u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 1u], int(oc0 + 1u)) & 0xFF) <<  8u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 2u], int(oc0 + 2u)) & 0xFF) << 16u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 3u], int(oc0 + 3u)) & 0xFF) << 24u;
+                actOut.d[outRowBase + m * pc.out_c4 + (oc0 >> 2)] = packed;
+            }
+            WG_SYNC();
+        }
+    }
+#endif
+
+#if PROBE == 4
+    /* ═══ 串行 nBlock 结构（诊断）═══
+     * 与下面的版本总工作量完全相同，唯一区别是**同一时刻只有 1 个 16×16 累加器存活**
+     * （原版 acc0..acc3 恒常存活 = 32 个寄存器，因为 nBlocks 是运行期值、无法折叠）。
+     * 代价：每个 nBlock 都要把 A 重新加载一遍（PROBE=1 已证明 A 加载只占 6%）。
+     * 若本分支显著更快 ⇒ 主因是「累加器寄存器压力」⇒ 正解是按 nBlocks 特化内核。 */
+    if (!staged) {
+        for (uint nb = 0u; nb < pc.nBlocks; ++nb) {
+            coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accS
+                    = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+            for (uint ky = 0u; ky < pc.kh; ++ky) {
+                const int iyB = int(oy) * int(pc.stride_h) - pc.pad_top + int(ky) + 1;
+                for (uint kx = 0u; kx < pc.kw; ++kx) {
+                    const uint aElem = uint(iyB) * inRowWordsB
+                                     + uint(int(ox0) * int(pc.stride_w) - pc.pad_left + int(kx) + 1) * pc.in_c4;
+                    const uint aStride = pc.stride_w * pc.in_c4;
+                    for (uint cdx = 0u; cdx < pc.cdxCount; ++cdx) {
+                        coopMatLoad(mA, actIn.d, aElem + cdx * 8u, aStride,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                        const uint chunk = (ky * pc.kw + kx) * pc.cdxCount + cdx;
+                        coopMatLoad(mB, wTc.d, chunk * 32u * pc.nPad + nb * 16u, pc.nPad,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                        accS = coopMatMulAdd(mA, mB, accS);
+                    }
+                }
+            }
+            if (rowOk) {
+                const uint outRowWords = (pc.outBorded != 0u) ? (pc.out_w + 2u) * pc.out_c4
+                                                              : pc.out_w * pc.out_c4;
+                const uint outRowBase  = ((pc.outBorded != 0u) ? (oy + 1u) * outRowWords + pc.out_c4
+                                                               : oy * outRowWords)
+                                         + ox0 * pc.out_c4;
+                const uint cout = pc.out_c4 * 4u;
+                coopMatStore(accS, sShared, warpBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                WG_SYNC();
+                for (uint i = lane; i < 64u; i += 32u) {
+                    const uint m   = i & 15u;
+                    const uint jg  = i >> 4;
+                    const uint oc0 = nb * 16u + jg * 4u;
+                    const uint ox  = ox0 + m;
+                    if (oc0 >= cout || ox >= pc.out_w) {
+                        continue;
+                    }
+                    const uint cbase = m * 16u + jg * 4u;
+                    uint packed = 0u;
+                    packed |= uint(quant1(sShared[warpBase + cbase + 0u], int(oc0 + 0u)) & 0xFF) <<  0u;
+                    packed |= uint(quant1(sShared[warpBase + cbase + 1u], int(oc0 + 1u)) & 0xFF) <<  8u;
+                    packed |= uint(quant1(sShared[warpBase + cbase + 2u], int(oc0 + 2u)) & 0xFF) << 16u;
+                    packed |= uint(quant1(sShared[warpBase + cbase + 3u], int(oc0 + 3u)) & 0xFF) << 24u;
+                    actOut.d[outRowBase + m * pc.out_c4 + (oc0 >> 2)] = packed;
+                }
+                WG_SYNC();
+            }
+        }
+    }
+#else
+    for (uint ky = 0u; ky < pc.kh; ++ky) {
+        /* 紧致坐标：-1 表示落在左边框/上边框里 */
+        const int iyC = int(oy) * int(pc.stride_h) - pc.pad_top + int(ky);
+        /* 带边框缓冲里对应的行（内部像素 (y,x) 落在 (y+1, x+1)） */
+        const int iyB = iyC + 1;
+        const bool yBad = hostIn && (iyC < 0 || iyC >= int(pc.inH));
+
+        for (uint kx = 0u; kx < pc.kw; ++kx) {
+            /* A 的「元素偏移」：第 0 行第 0 列在激活缓冲里的 word 下标。
+             * 行 m 对应像素 (iyB, (ox0+m)*sW - padL + kx + 1)，
+             * 所以行跨距恒为 sW 个像素 = stride_w * in_c4 个 word（单一跨距，可直接加载）。 */
+            const uint aElem = uint(iyB) * inRowWordsB
+                             + uint(int(ox0) * int(pc.stride_w) - pc.pad_left + int(kx) + 1) * pc.in_c4;
+            const uint aStride = pc.stride_w * pc.in_c4;
+
+            for (uint cdx = 0u; cdx < pc.cdxCount; ++cdx) {
+                if (staged) {
+                    /* ── 暂存路径（主机输入无边框，越界必须显式判定）──
+                     * 32 lane 分摊 128 个 word，每人 4 个。 */
+                    for (uint e = 0u; e < 4u; ++e) {
+                        const uint idx = lane + e * 32u;
+                        const uint m   = idx >> 3;          /* 输出像素 0..15 */
+                        const uint w4  = idx & 7u;          /* 行内 word 0..7 */
+                        const uint ic4 = cdx * 8u + w4;     /* 全局通道组 */
+                        uint val = 0x80808080u;             /* 默认 z_a（−128 ×4） */
+                        if (ic4 < pc.in_c4 && !yBad) {
+                            const int ixC = (int(ox0) + int(m)) * int(pc.stride_w)
+                                            - pc.pad_left + int(kx);
+                            if (!(ixC < 0 || ixC >= int(pc.in_w))) {
+                                val = actIn.d[uint(iyC) * inRowWords
+                                              + uint(ixC) * pc.in_c4 + ic4];
+                            }
+                        }
+                        sShared[warpBase + idx] = int(val);
+                    }
+                    WG_SYNC();
+
+                    /* coopMatLoad 会写满全部元素，不需要先清零 */
+                    /* sShared 是 int[] 视图，元素 4 字节 ⇒ 行跨距仍是 8 */
+                    coopMatLoad(mA, sShared, warpBase, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    /* ── 直接路径（带边框缓冲）──
+                     * 越界 tap 由 0x80 边框天然供给；通道补齐位读到的「越界 word」
+                     * 乘以权重里的 0 ⇒ 贡献 0，所以不需要任何掩码。
+                     * 一次省掉「128 次 shared 写 + 2 次 barrier」。 */
+#if PROBE == 1
+                    coopMatLoad(mA, actIn.d, 0u, 8u,
+                                gl_CooperativeMatrixLayoutRowMajor);
+#else
+                    coopMatLoad(mA, actIn.d, aElem + cdx * 8u, aStride,
+                                gl_CooperativeMatrixLayoutRowMajor);
+#endif
+                }
+
+                /* ───── MMA：A(16×32) × B(32×16) + C ───── */
+                const uint chunk = (ky * pc.kw + kx) * pc.cdxCount + cdx;
+#if PROBE == 6
+                const uint bBase = 0u;   /* 诊断：B 全命中同一 cache line */
+#else
+                const uint bBase = chunk * 32u * pc.nPad;
+#endif
+                if (nBlocksUse > 0u) {
+                    coopMatLoad(mB, wTc.d, bBase, pc.nPad,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc0 = coopMatMulAdd(mA, mB, acc0);
+#if PROBE == 9
+                    /* 诊断：把 MMA 数量 +50%（其它一切不变）⇒ 判断是否 MMA 受限 */
+                    acc0 = coopMatMulAdd(mA, mB, acc0);
+#endif
+                }
+                if (nBlocksUse > 1u) {
+                    coopMatLoad(mB, wTc.d, bBase + 16u, pc.nPad,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc1 = coopMatMulAdd(mA, mB, acc1);
+                }
+                if (nBlocksUse > 2u) {
+                    coopMatLoad(mB, wTc.d, bBase + 32u, pc.nPad,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc2 = coopMatMulAdd(mA, mB, acc2);
+                }
+                if (nBlocksUse > 3u) {
+                    coopMatLoad(mB, wTc.d, bBase + 48u, pc.nPad,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc3 = coopMatMulAdd(mA, mB, acc3);
+                }
+                if (staged) {
+                    /* A 已被 MMA 消费完，可以安全地被下一轮覆盖 */
+                    WG_SYNC();
+                }
+            }
+        }
+    }
+
+#if PROBE == 12
+    /* ── P12：导出批量化 ──
+     * 原结构是「每块：store → barrier → 打包 → barrier」，块与块之间被 barrier 串行化，
+     * 关键路径 = nBlocks × (store→shared 的延迟 + 2 次 barrier 的等待)。
+     * 这里把全部累加器一次性倒进 shared，然后只做**一对** barrier，
+     * 再统一打包 —— 关键路径变成 1 次 store 延迟 + 2 次 barrier。
+     * 代价：shared 1 KiB → 4 KiB（占用率会让一点）。 */
+    if (rowOk) {
+        const uint outRowWords = (pc.outBorded != 0u) ? (pc.out_w + 2u) * pc.out_c4
+                                                      : pc.out_w * pc.out_c4;
+        const uint outRowBase  = ((pc.outBorded != 0u) ? (oy + 1u) * outRowWords + pc.out_c4
+                                                       : oy * outRowWords)
+                                 + ox0 * pc.out_c4;
+        const uint cout = pc.out_c4 * 4u;
+
+        if (pc.nBlocks > 0u) {
+            coopMatStore(acc0, sShared, warpBase,   16u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        if (pc.nBlocks > 1u) {
+            coopMatStore(acc1, sShared, 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        if (pc.nBlocks > 2u) {
+            coopMatStore(acc2, sShared, 512u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        if (pc.nBlocks > 3u) {
+            coopMatStore(acc3, sShared, 768u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        WG_SYNC();
+
+        for (uint nb = 0u; nb < nBlocksUse; ++nb) {
+            for (uint i = lane; i < 64u; i += 32u) {
+                const uint m   = i & 15u;
+                const uint jg  = i >> 4;
+                const uint oc0 = nb * 16u + jg * 4u;
+                const uint ox  = ox0 + m;
+                if (oc0 >= cout || ox >= pc.out_w) {
+                    continue;
+                }
+                const uint cbase = nb * 256u + m * 16u + jg * 4u;
+                uint packed = 0u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 0u], int(oc0 + 0u)) & 0xFF) <<  0u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 1u], int(oc0 + 1u)) & 0xFF) <<  8u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 2u], int(oc0 + 2u)) & 0xFF) << 16u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 3u], int(oc0 + 3u)) & 0xFF) << 24u;
+                actOut.d[outRowBase + m * pc.out_c4 + (oc0 >> 2)] = packed;
+            }
+        }
+        WG_SYNC();
+    }
+#else
+    /* ───── 累加器导出 + 重量化 + 打包 ─────
+     * ★ 逐 nBlock 处理：每次只把 1 个 16×16 累加器倒进 sShared（256 int），
+     *   打完包再处理下一块。这样共享内存只需 1 KiB（见文件头说明）。 */
+    if (rowOk) {
+        const uint outRowWords = (pc.outBorded != 0u) ? (pc.out_w + 2u) * pc.out_c4
+                                                      : pc.out_w * pc.out_c4;
+        const uint outRowBase  = ((pc.outBorded != 0u) ? (oy + 1u) * outRowWords + pc.out_c4
+                                                       : oy * outRowWords)
+                                 + ox0 * pc.out_c4;
+        const uint cout = pc.out_c4 * 4u;
+
+        for (uint nb = 0u; nb < nBlocksExp; ++nb) {
+            if (nb == 0u) {
+                coopMatStore(acc0, sShared, warpBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            } else if (nb == 1u) {
+                coopMatStore(acc1, sShared, warpBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            } else if (nb == 2u) {
+                coopMatStore(acc2, sShared, warpBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc3, sShared, warpBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            WG_SYNC();
+
+            /* 本块共 16 像素 × 4 个通道组 = 64 个 word */
+#if PROBE == 8
+            /* 诊断：跳过整个打包循环（保留 coopMatStore 以免累加器被死代码消除） */
+            if (lane == 0u) { actOut.d[outRowBase] = uint(sShared[warpBase]); }
+#else
+            for (uint i = lane; i < 64u; i += 32u) {
+                const uint m   = i & 15u;
+                const uint jg  = i >> 4;
+                const uint oc0 = nb * 16u + jg * 4u;
+                const uint ox  = ox0 + m;
+                if (oc0 >= cout || ox >= pc.out_w) {
+                    continue;
+                }
+                const uint cbase = m * 16u + jg * 4u;
+                uint packed = 0u;
+#if PROBE == 3
+                /* 跳过重量化：直接打包累加器低字节（只测量化开销） */
+                packed |= (uint(sShared[warpBase + cbase + 0u]) & 0xFFu) <<  0u;
+                packed |= (uint(sShared[warpBase + cbase + 1u]) & 0xFFu) <<  8u;
+                packed |= (uint(sShared[warpBase + cbase + 2u]) & 0xFFu) << 16u;
+                packed |= (uint(sShared[warpBase + cbase + 3u]) & 0xFFu) << 24u;
+#else
+                packed |= uint(quant1(sShared[warpBase + cbase + 0u], int(oc0 + 0u)) & 0xFF) <<  0u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 1u], int(oc0 + 1u)) & 0xFF) <<  8u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 2u], int(oc0 + 2u)) & 0xFF) << 16u;
+                packed |= uint(quant1(sShared[warpBase + cbase + 3u], int(oc0 + 3u)) & 0xFF) << 24u;
+#endif
+                actOut.d[outRowBase + m * pc.out_c4 + (oc0 >> 2)] = packed;
+            }
+#endif
+            WG_SYNC();
+        }
+    }
+#endif
+#endif
+}

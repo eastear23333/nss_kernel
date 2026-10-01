@@ -1,0 +1,11 @@
+# debug snapshots & reference dumps (regenerable via scripts)
+*.npz
+*.npy
+__pycache__/
+dump_*
+ref_official/
+reg/
+oracle/*
+!oracle/make_oracle.py
+*.log
+*.tmp

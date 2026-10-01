@@ -1,0 +1,9 @@
+#version 450
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018], id = 4450)
+int sdot2(uint v1, uint v2);
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly  buffer A { uint a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { uint b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { int  c[]; };
+void main(){ uint i=gl_GlobalInvocationID.x; c[i]=sdot2(a[i], b[i]); }
