@@ -1,36 +1,46 @@
-# NSS DP4A 后端（独立 Vulkan 运行器）
+# nss_kernel —— NSS GPU 内核源与内核级验证台
 
-在真实 GPU 上以 DP4A 执行 Arm NSS 神经网络，输出与 numpy 黄金参考**位精确一致**。
+在真实 GPU 上执行 Arm NSS 神经网络的 compute 内核（GLSL→SPIR-V）与配套验证工具，
+输出与 numpy 黄金参考**位精确一致**。
 
 **不依赖 C++ 编译器、不依赖第三方 Python 包**：用 `ctypes` 直连 `vulkan-1.dll`，
-着色器由 SDK 自带的 `glslangValidator` 编译成 SPIR-V。
+着色器由 glslangValidator 编译成 SPIR-V。
+
+与 [nss](https://github.com/eastear23333/nss)（nss_dp4a.dll，推理后端）的关系：
+本仓库的 `shaders/*.comp` 编译出的 SPIR-V 被 nss 仓库烘焙进
+`generated/nss_spirv_embed.h`；本仓库同时提供内核级验证台（单算子 / 整网 / 官方对拍）。
 
 ---
 
 ## 快速开始
 
+依赖：Python 3.12+（仅 `numpy`）、glslangValidator（Vulkan SDK 的 `Bin/` 下，
+或 Arm neural-graphics SDK 的 `sdk/tools/binary_store/` 下）。
+
 ```bash
-PY=C:/Users/Administrator/AppData/Local/Programs/Python/Python312/python.exe
+# 0) 约定：nss 仓库 clone 到同级目录（参考脚本在 ../nss/tools/）
+git clone https://github.com/eastear23333/nss ../nss
 
 # 1) 编译着色器（改过 .comp 后需要重跑）
 cd shaders
-SC="../../neural-graphics-sdk-for-game-engines/sdk/tools/binary_store/glslangValidator.exe"
-for f in conv_rq resize2x concat_copy; do $SC -V --target-env vulkan1.2 $f.comp -o $f.spv; done
+GLSLANG=/path/to/glslangValidator.exe
+for f in conv_rq conv_tc resize2x concat_copy; do $GLSLANG -V --target-env vulkan1.2 $f.comp -o $f.spv; done
 
-# 2) 跑网络（544×960 = 540p）
+# 2) 跑网络（544×960 ≈ 540p 渲染分辨率；模型 .vgf 需按 nss 仓库 README 的许可节获取）
 cd ..
-$PY -u nss_vk.py "../../nss-model/nss_v1_0_1_high_int8.vgf" --h 544 --w 960 -o gpu.npz --repeat 30
+PY=python
+$PY -u nss_vk.py "<MODELS>/nss_v1_0_1_high_int8.vgf" --h 544 --w 960 -o gpu.npz --repeat 30
 
 # 3) 与 numpy 黄金参考对拍（判据：位精确相等）
-$PY -u ../../nss-tools/nss_ref.py "../../nss-model/nss_v1_0_1_high_int8.vgf" --input gpu.npz -o ref.npz
-$PY -u ../../nss-tools/nss_compare.py ref.npz gpu.npz
+$PY -u ../nss/tools/nss_ref.py "<MODELS>/nss_v1_0_1_high_int8.vgf" --input gpu.npz -o ref.npz
+$PY -u ../nss/tools/nss_compare.py ref.npz gpu.npz
 ```
 
 常用参数：`--h/--w`（必须 8 的倍数）、`--seed`、`--repeat`（测平均耗时）、
 `--dump-all DIR`（导出全部中间张量）、`--debug-op N`（导出第 N 个卷积的累加器/量化中间量）。
 
 **内存模式**：默认 `DEVICE_LOCAL`（显存，经 staging 往返），这是生产配置。
-`--host-memory` 可切回系统内存，**仅供对照**——会慢 19 倍。
+`--host-memory` 可切回系统内存，**仅供对照**——慢一个数量级以上。
 
 ---
 
@@ -65,39 +75,32 @@ KPN `(H/4, W/4, 36)`（mid_low 为 16 通道）、时序 `(H, W, 4)`。
 
 ---
 
-## 性能
+## 性能要点
 
-540p（544×960），GTX 1660 Ti，50 次平均：
+具体基准数字随驱动版本与机型漂移，此处只留可复现的结构性结论
+（复测方法：`nss_vk.py --repeat N` 测帧均，`../nss/tools/nss_compare.py` 对拍）：
 
-| 实现 | 耗时 | FPS |
-|---|---|---|
-| **本 DP4A 后端** | **9.6 ms** | **104** |
-| 本后端（中间张量放系统内存，仅对照） | 187.2 ms | 5.3 |
-| Arm 仿真层（`VMEL_GRAPH_PROFILING`，37 算子） | 277.4 ms | 3.6 |
-
-**相对仿真层约 29 倍；把中间张量从系统内存挪到显存单此一项就带来 19.5 倍。**
-
-实测吞吐 613 GMAC/s，约为 GTX 1660 Ti FP32 峰值的 45%；耗时随面积线性
-（272p→544p 面积 4 倍、耗时 4.1 倍），说明已转为**算力受限**。
-
-**已试过但无收益的优化**：权重放 workgroup 共享内存（单层最大 36 KiB）。
-权重总量仅 146 KiB，L2 已完全容纳，实测 9.58 vs 9.36 ms —— **无提升**。
-结论：瓶颈不在权重带宽。
-
-**尚未做的优化**：CONCAT/RESIZE 融进消费者卷积可降到 16 次 dispatch。
+- **中间张量放显存**（`DEVICE_LOCAL` + staging 往返）是决定性优化；放系统内存
+  慢一个数量级以上，仅作对照。
+- 相对 Arm 仿真层（`VK_LAYER_ML_Graph_Emulation`，37 算子逐算子调度）
+  有**数量级**提升。
+- **权重放 workgroup shared memory 无收益**：权重总量仅 146 KiB，L2 已完全容纳，
+  瓶颈不在权重带宽（有 A/B 实测数据支撑）。
+- DP4A 内核耗时随输入面积线性增长 → 已是**算力受限**，进一步提速依赖
+  Tensor Core 路径（`conv_tc.comp`）或每线程多像素。
 
 ---
 
-## 硬件前提（本机实测，GTX 1660 Ti）
+## 硬件前提（实测）
 
-| 能力 | 状态 |
-|---|---|
-| `integerDotProduct4x8BitPackedSignedAccelerated` | 是 |
-| `shaderIntegerDotProduct` 特性 | 可启用 |
-| `shaderInt64`（requantize 需要） | 是 |
-| `VK_KHR_cooperative_matrix` | **无** —— TU116 没有 Tensor Core |
+| 能力 | GTX 1660 Ti (TU116) | RTX 4060 (AD107) |
+|---|---|---|
+| `integerDotProduct4x8BitPackedSignedAccelerated` | 是 | 是 |
+| `shaderIntegerDotProduct` 特性 | 可启用 | 可启用 |
+| `shaderInt64`（requantize 需要） | 是 | 是 |
+| `VK_KHR_cooperative_matrix` | **无**（无 Tensor Core）→ 走 DP4A | **有**，int8 MMA 16×16×32（sint8→sint32，subgroup）→ `conv_tc.comp` 生效 |
 
-用 `nss-tools/vk_probe.py` 可以在别的卡上复测。
+用 `../nss/tools/vk_probe.py` 可以在别的卡上复测。
 
 ---
 
@@ -107,11 +110,25 @@ KPN `(H/4, W/4, 36)`（mid_low 为 16 通道）、时序 `(H, W, 4)`。
 
 | 内核 | 次数 | 说明 |
 |---|---|---|
-| `conv_rq.comp` | 14 | 融合 `CONV2D + bias + DP4A修正 + RESCALE(+LUT)` |
+| `conv_rq.comp` | 14 | 融合 `CONV2D + bias + DP4A修正 + RESCALE(+LUT)`；OpSDot/DP4A 路径 |
+| `conv_tc.comp` | —（按层替换 conv_rq） | cooperative matrix Tensor Core 变体（见下节） |
 | `resize2x.comp` | 3 | 2× 最近邻 |
 | `concat_copy.comp` | 2 | 通道轴拼接 |
 
 **尚未做的优化**：CONCAT/RESIZE 融进消费者卷积可降到 16 次。
+
+### conv_tc.comp（Tensor Core 变体）要点
+
+- 形状取自驱动上报的 sint8 形状 **M=16 N=16 K=32**（一次 MMA 出 16 个输出通道）。
+  coop-mat 的 M/N/K 是 **SPIR-V 编译期常量**，运行时不可变 —— 跨厂商泛化必须
+  按形状出多份编译产物。
+- 矩阵切分：A（16×32）= 16 个同一行的连续输出像素 × 32 个输入通道；
+  B（32×16）= 32 输入通道 × 16 输出通道；C/累加器（16×16）int32。
+- K 轴按 `(ky, kx, cdx)` 分块，每块 32 个通道；Cin 不是 32 倍数时激活用 `z_a(−128)`
+  填充、权重补 0。
+- int8 矩阵放在 shared `uint[]` 时行跨距要传 **8 word**（=32 字节），不是 32。
+- 提供单累加器版本（同一时刻只有 1 个 16×16 累加器存活，省寄存器）与
+  acc0..acc3 恒常版本，按占用率取舍。
 
 ---
 
@@ -144,7 +161,7 @@ NSS 的 12 个 ReLU 层 `output_zero_point = −128`，配上限幅到 `[−128,
 ### 5. requantize 必须用 64 位
 
 `acc (~25 位) × multiplier (最大 31 位)` 乘积可达 **56 位**，32 位会溢出。
-本机 `shaderInt64` 可用，直接 `int64_t`。
+直接 `int64_t`（需 `shaderInt64`）。
 
 ### 6. glslang 15.4 不支持 `GL_EXT_shader_integer_dot_product`
 
@@ -161,7 +178,7 @@ int spv_sdot(uint v1, uint v2);
 acc += spv_sdot(a, w);      // OpSDot 不含累加操作数，累加在外面做
 ```
 
-用 `nss-vk/dot4_test.py` 可在任意卡上验证 `OpSDot` 的打包语义与符号解释。
+用 `dot4_test.py` 可在任意卡上验证 `OpSDot` 的打包语义与符号解释。
 
 ---
 
@@ -191,12 +208,11 @@ acc += spv_sdot(a, w);      // OpSDot 不含累加操作数，累加在外面做
 
 | 项 | 状态 |
 |---|---|
-| 中间张量放显存 | **已做** —— 19.5 倍收益，这是决定性的一步 |
+| 中间张量放显存 | **已做** —— 数量级收益，决定性的一步 |
 | 权重放 shared memory | **已试，无收益** —— 权重共 146 KiB，L2 已完全容纳 |
+| cooperative matrix 路径 | **已做**（`conv_tc.comp`，NVIDIA 16×16×32；AMD/Intel 形状泛化见 nss 仓库 README） |
 | CONCAT/RESIZE 融进消费者卷积 | 未做，19 → 16 dispatch |
-| 每线程多像素（提高 DP4A/加载 比） | 未做，当前 45% 峰值利用率 |
-
-设计文档 `../NSS-DP4A-kernel-design.md` 里有成本模型与 tiling 建议。
+| 每线程多像素（提高 DP4A/加载 比） | 未做，DP4A 路径距峰值利用率仍有空间 |
 
 ---
 
@@ -209,7 +225,7 @@ acc += spv_sdot(a, w);      // OpSDot 不含累加操作数，累加在外面做
 # 生成场景（位置参数：输入 .npy，输出目录）
 python oracle/make_oracle.py 输入.npy oracle/run
 
-# 用仿真层跑（需要 nss-verify venv）
+# 用仿真层跑（需要 nss-verify venv，VK_LAYER_PATH 指向仿真层部署目录）
 export VK_LAYER_PATH="$VENV/Lib/site-packages/emulation_layer/deploy/bin"
 export VK_INSTANCE_LAYERS="VK_LAYER_ML_Graph_Emulation;VK_LAYER_ML_Tensor_Emulation"
 cd oracle/run && scenario-runner --scenario mini_graph.json --output out --log-level warning
@@ -228,10 +244,13 @@ cd oracle/run && scenario-runner --scenario mini_graph.json --output out --log-l
 |---|---|
 | `nss_vk.py` | 运行器（Vulkan 全部用 ctypes，无第三方依赖） |
 | `verify_all.py` | **四层验证一键回归** |
+| `nss_verify_official.py` | 第 4 层：与 Arm 官方真实帧对拍 |
 | `dot4_test.py` | `OpSDot` 语义最小测试 |
+| `msvc_env.sh` | MSVC 环境变量速查（Git Bash 下编译 nss 仓库用） |
 | `oracle/make_oracle.py` | 生成最小数据图场景（官方 oracle） |
 | `oracle/query.py` | 用受控输入查询 oracle（脉冲/零点等模式） |
-| `shaders/conv_rq.comp` | 融合卷积内核 |
+| `shaders/conv_rq.comp` | 融合卷积内核（OpSDot/DP4A） |
+| `shaders/conv_tc.comp` | 融合卷积内核（cooperative matrix Tensor Core） |
 | `shaders/resize2x.comp` | 2× 最近邻 |
 | `shaders/concat_copy.comp` | 通道拼接 |
 | `shaders/dp4a_test.comp`、`t2.comp`、`t3.comp` | 编译探针（可删） |
@@ -240,6 +259,7 @@ cd oracle/run && scenario-runner --scenario mini_graph.json --output out --log-l
 
 ## 许可
 
-内核源码与验证脚本为自研实现（与 `nss` 仓库的 nss_dp4a.dll 配套），MIT 许可。
-`shaders/*.comp` 编译产物（.spv / `generated/nss_spirv_embed.h`）随 nss 仓库分发；
+内核源码与验证脚本为自研实现（与 [nss](https://github.com/eastear23333/nss)
+仓库的 nss_dp4a.dll 配套），MIT 许可（© 2026 eastear23333）。
+`shaders/*.comp` 编译产物（.spv / nss 仓库的 `generated/nss_spirv_embed.h`）随 nss 仓库分发；
 oracle / ref_official / reg 下的参考快照不入库，由 `make_oracle.py` 与 verify 脚本重新生成。
